@@ -1,0 +1,13 @@
+python-dotenv>=1.0.1
+streamlit>=1.37.0
+langchain>=0.2.14
+langgraph>=0.2.23
+langchain-community>=0.2.10
+openai>=1.40.0
+duckduckgo-search>=6.2.11
+rank-bm25>=0.2.2
+tiktoken>=0.7.0
+faiss-cpu>=1.8.0
+numpy>=1.26.4
+scikit-learn>=1.5.0
+pydantic>=2.8.2
