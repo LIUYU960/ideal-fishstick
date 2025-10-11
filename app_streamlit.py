@@ -1,7 +1,7 @@
 import streamlit as st
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
-from graph.workflow import GRAPH, GraphState
+from workflow import GRAPH, GraphState
 
 load_dotenv()
 
