@@ -1,48 +1,36 @@
+# app_streamlit.py
+import os, re, streamlit as st
 from dotenv import load_dotenv
-load_dotenv(override=False)  # 避免 .env 覆盖 Secrets
 
-import os, streamlit as st
-from openai import OpenAI
+# 不要用 .env 覆盖 Streamlit Secrets
+load_dotenv(override=False)
 
-API_KEY = st.secrets["OPENAI_API_KEY"].strip()
-os.environ["OPENAI_API_KEY"] = API_KEY  # 需要的话，仍设置到环境里
+# ✅ 正确导入：同目录下的 workflow.py 导出 GRAPH
+from workflow import GRAPH
 
-# 最小直连测试（成功则不抛异常）
-OpenAI(api_key=API_KEY).models.list()
+def _sanitize(name: str):
+    v = os.getenv(name, "")
+    if not v:
+        return
+    v = v.strip()
+    v = re.sub(r"[^\x00-\x7F]+", "", v)  # 删除非 ASCII
+    os.environ[name] = v
 
+# 清理并设定 OPENAI_API_KEY（来自 Secrets）
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"].strip()
+_sanitize("OPENAI_API_KEY")
 
-st.set_page_config(page_title="RAG Chatbot (LangGraph)", page_icon="🔎")
-st.title("🔎 LangChain/LangGraph 기반 RAG 챗봇")
+st.set_page_config(page_title="LangChain/LangGraph RAG", page_icon="🔎", layout="wide")
+st.markdown("### 🔎 LangChain/LangGraph 기반 RAG 챗봇")
 
-# —— 主区输入（不用侧边栏，避免没展开看不到）——
-st.markdown("### 询问 / Ask")
-question = st.text_input("请输入你的问题（韩/中/英均可）", value="하이브리드 검색과 reranking이 뭐예요?")
-run = st.button("发送 / Ask", type="primary")
-
-if run:
-    try:
-        # 关键：只传最小输入，避免 Pydantic 校验错误
-        result = GRAPH.invoke({"question": question})
-
-        st.success("完成！")
-        st.markdown("#### 答复 / Answer")
-        st.write(result.get("answer", ""))
-
-        st.markdown("#### 验证与元信息 / Validation & Meta")
-        st.json(result.get("meta", {}))
-
-        if result.get("contexts"):
-            st.markdown("#### 使用到的检索上下文 / Contexts")
-            for i, c in enumerate(result["contexts"], 1):
-                with st.expander(f"Context {i}"):
-                    st.write(c)
-
-    except Exception as e:
-        import traceback
-        st.error("Graph 执行出错")
-        st.code("".join(traceback.format_exc()))
-import os, streamlit as st
-st.caption("KEY OK" if (os.getenv("OPENAI_API_KEY","").startswith("sk-") and os.getenv("OPENAI_API_KEY","").isascii()) else "NO/INVALID KEY")
-from openai import OpenAI
-client = OpenAI()
-client.models.list()  # 如果这里 401，说明 key 在 OpenAI 侧就是无效/未开通
+question = st.text_input("询问 / Ask（韩/中/英均可）")
+if st.button("发送 / Ask") and question.strip():
+    with st.spinner("Running graph..."):
+        try:
+            result = GRAPH.invoke({"question": question.strip()})
+            answer = result.get("answer", "(no answer)")
+            st.success("回答 / Answer")
+            st.write(answer)
+        except Exception as e:
+            st.error(f"Graph 执行出错：{type(e).__name__}: {e}")
