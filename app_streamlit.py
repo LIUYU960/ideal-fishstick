@@ -40,3 +40,6 @@ if run:
         st.code("".join(traceback.format_exc()))
 import os, streamlit as st
 st.caption("KEY OK" if (os.getenv("OPENAI_API_KEY","").startswith("sk-") and os.getenv("OPENAI_API_KEY","").isascii()) else "NO/INVALID KEY")
+from openai import OpenAI
+client = OpenAI()
+client.models.list()  # 如果这里 401，说明 key 在 OpenAI 侧就是无效/未开通
