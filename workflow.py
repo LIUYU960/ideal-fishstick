@@ -1,8 +1,8 @@
-# workflow.py —— LangGraph RAG with robust fallbacks (safe on Streamlit Cloud)
+# workflow.py — LangGraph RAG with robust fallbacks (safe on Streamlit Cloud)
 
 import os
 import re
-from typing import TypedDict, List, Literal, Dict, Any
+from typing import TypedDict, List, Literal, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 
 # ---------- Optional imports with fallbacks ----------
@@ -24,7 +24,7 @@ try:
 except Exception:
     HAVE_ST = False
 
-# DuckDuckGo（可选）
+# DuckDuckGo (optional)
 try:
     from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
     from langchain_community.tools import DuckDuckGoSearchRun
@@ -32,7 +32,7 @@ try:
 except Exception:
     HAVE_DDG_IMPORTS = False
 
-# 文档与分块（若不可用则提供极简替代）
+# Docs & splitters (fallback if missing)
 try:
     from langchain.docstore.document import Document
     from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -43,9 +43,13 @@ except Exception:
             self.metadata = metadata or {}
     class RecursiveCharacterTextSplitter:
         def __init__(self, chunk_size=800, chunk_overlap=120):
-            self.chunk_size = chunk_size; self.chunk_overlap = chunk_overlap
-        def split_text(self, text: str):
-            chunks, n, k, o = [], len(text), self.chunk_size, self.chunk_overlap
+            self.chunk_size = chunk_size
+            self.chunk_overlap = chunk_overlap
+        def split_text(self, text):
+            chunks = []
+            n = len(text)
+            k = self.chunk_size
+            o = self.chunk_overlap
             i = 0
             while i < n:
                 chunks.append(text[i:i+k])
@@ -63,10 +67,10 @@ class RAGState(TypedDict, total=False):
     validation: Dict[str, Any]
 
 # ------------------ LLM helpers ------------------
-def make_llm(model: str | None = None, temperature: float = 0.0):
+def make_llm(model: Optional[str] = None, temperature: float = 0.0):
     if HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"):
-        return ChatOpenAI(model=model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-                          temperature=temperature)
+        use_model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        return ChatOpenAI(model=use_model, temperature=temperature)
     class DummyLLM:
         def invoke(self, prompt):
             txt = str(prompt)
@@ -79,9 +83,11 @@ def make_embeddings():
     if HAVE_ST:
         return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     class HashEmb:
-        def embed_documents(self, texts: List[str]): return [self._e(t) for t in texts]
-        def embed_query(self, text: str): return self._e(text)
-        def _e(self, t: str):
+        def embed_documents(self, texts):
+            return [self._e(t) for t in texts]
+        def embed_query(self, text):
+            return self._e(text)
+        def _e(self, t):
             import math
             v = [0.0]*256
             for i, ch in enumerate(t.encode("utf-8")):
@@ -91,8 +97,8 @@ def make_embeddings():
     return HashEmb()
 
 # ------------------ Vector store / Retriever ------------------
-def build_text_corpus(docs_path: str = "docs"):
-    texts: List[Document] = []
+def build_text_corpus(docs_path="docs"):
+    texts = []
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
     if os.path.isdir(docs_path):
         for root, _, files in os.walk(docs_path):
@@ -107,10 +113,11 @@ def build_text_corpus(docs_path: str = "docs"):
     return texts
 
 class DummyVS:
-    def __init__(self, docs: List[Document]): self.docs = docs
-    def similarity_search(self, q: str, k: int = 8):
+    def __init__(self, docs):
+        self.docs = docs
+    def similarity_search(self, q, k=8):
         qset = set(re.findall(r"\w+", q.lower()))
-        def score(d: Document):
+        def score(d):
             words = set(re.findall(r"\w+", d.page_content.lower()))
             return len(qset & words)
         return sorted(self.docs, key=score, reverse=True)[:k]
@@ -118,7 +125,8 @@ class DummyVS:
 _VS = None
 def get_vs():
     global _VS
-    if _VS is not None: return _VS
+    if _VS is not None:
+        return _VS
     docs = build_text_corpus("docs")
     if HAVE_FAISS:
         embeddings = make_embeddings()
@@ -135,14 +143,14 @@ def _safe_ddg(max_results=4):
         wrapper = DuckDuckGoSearchAPIWrapper(region="wt-wt", time="y", max_results=max_results)
         return DuckDuckGoSearchRun(api_wrapper=wrapper)
     except Exception as e:
-        raise ImportError(f"duckduckgo-search unavailable: {e}")
+        raise ImportError("duckduckgo-search unavailable: %s" % e)
 
 # ------------------ Nodes ------------------
 def retrieve_node(state: RAGState) -> RAGState:
     q = state["question"]
     vs = get_vs()
     docs = vs.similarity_search(q, k=8)
-    state["retrieved_docs"] = [f"[{i+1}] {d.metadata.get('source','')} :: {d.page_content}"
+    state["retrieved_docs"] = ["[%d] %s :: %s" % (i+1, d.metadata.get("source",""), d.page_content)
                                for i, d in enumerate(docs)]
     coverage = sum(len(d.page_content) for d in docs[:3])
     state["validation"] = {"coverage": coverage}
@@ -158,8 +166,7 @@ def rerank_node(state: RAGState) -> RAGState:
     prompt = (
         "You are a reranker. Given a question and a list of documents in the form [index] text, "
         "return the top 3 indices (comma-separated) that best answer the question.\n\n"
-        f"Question: {state['question']}\n"
-        "Documents:\n" + "\n".join(docs[:8]) + "\n\nReturn: "
+        "Question: %s\nDocuments:\n%s\n\nReturn: " % (state["question"], "\n".join(docs[:8]))
     )
     try:
         out = llm.invoke(prompt).content
@@ -182,7 +189,7 @@ def websearch_node(state: RAGState) -> RAGState:
         state["web_results"] = ["(web search unavailable: install `duckduckgo-search` to enable)"]
         return state
     except Exception as e:
-        state["web_results"] = [f"(web search init failed: {e})"]
+        state["web_results"] = ["(web search init failed: %s)" % e]
         return state
     q = state["question"]
     try:
@@ -190,14 +197,10 @@ def websearch_node(state: RAGState) -> RAGState:
         results = [ln.strip() for ln in str(raw).split("\n") if ln.strip()]
         state["web_results"] = results[:4]
     except Exception as e:
-        state["web_results"] = [f"(web search failed: {e})"]
+        state["web_results"] = ["(web search failed: %s)" % e]
     return state
 
 def react_node(state: RAGState) -> RAGState:
-    """
-    轻量 ReAct：不用 LangChain Agents，避免 pydantic 依赖。
-    思考→内部检索→必要时网页搜索→综合出草稿答案。
-    """
     q = state["question"]
     vs = get_vs()
     docs = vs.similarity_search(q, k=4)
@@ -214,34 +217,29 @@ def react_node(state: RAGState) -> RAGState:
     llm = make_llm()
     prompt = (
         "You are a ReAct-style assistant. Think step by step using the observations.\n"
-        f"Question: {q}\n\n"
-        "Observation[internal]:\n" + internal + "\n\n" +
-        ("Observation[web]:\n" + web_text + "\n\n" if web_text else "") +
+        "Question: %s\n\nObservation[internal]:\n%s\n\n%s"
         "Draft a concise answer in the user's language. Cite internal chunks as [1] and web info as [web] when used."
+        % (q, internal, ("Observation[web]:\n%s\n\n" % web_text) if web_text else "")
     )
     try:
         out = llm.invoke(prompt).content
     except Exception as e:
-        out = f"(react synth failed: {e})\n\n{prompt[:600]}"
+        out = "(react synth failed: %s)\n\n%s" % (e, prompt[:600])
     state["draft_answer"] = out
     return state
 
 # ---- No LLM fallback helpers ----
-def _detect_lang(s: str):
-    if any('\u4e00' <= ch <= '\u9fff' for ch in s): return "zh"
-    if any('가' <= ch <= '힣' for ch in s): return "ko"
+def _detect_lang(s):
+    for ch in s:
+        if u"\u4e00" <= ch <= u"\u9fff":
+            return "zh"
+        if u"\uac00" <= ch <= u"\ud7a3":
+            return "ko"
     return "en"
 
-def _simple_cn2ko_rule(q: str):
-    """识别“X韩语怎么说”并给出常见词的直译。"""
-    m = re.search(r"(.*?)(用)?韩语怎么说", q)
-    if not m: 
-        return None
-    term = m.group(1).strip()
-    mapping = {
-        "中文":"중국어","韩语":"한국어","英语":"영어","日语":"일본어",
-        "中国":"중국","韩国":"한국","北京":"베이징","首尔":"서울",
-        "谢谢":"감사합니다","你好":"안녕하세요","对不起":
+def _simple_cn2ko_rule(q):
+    m = re.se
+
 
 
 
