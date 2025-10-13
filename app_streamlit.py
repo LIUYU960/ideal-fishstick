@@ -1,8 +1,17 @@
 import os
+import importlib
 import streamlit as st
-from workflow import GRAPH
 
 st.set_page_config(page_title="LIUYU RAG LangGraph Chatbot", page_icon="💬")
+
+# ----- 安全导入 workflow.GRAPH，避免语法错误导致整页崩 -----
+try:
+    workflow = importlib.import_module("workflow")
+    GRAPH = getattr(workflow, "GRAPH")
+except Exception as e:
+    st.error("加载 workflow.py 时出错：\n\n" + repr(e))
+    st.info("请检查 workflow.py 是否粘贴完整（括号/引号成对、无奇怪字符）。")
+    st.stop()
 
 st.title("LIUYU — RAG Chatbot (LangGraph) 💬")
 st.write("LangChain + LangGraph + Streamlit. 支持：检索/重排/网页搜索/ReAct/验证（无依赖也能兜底运行）。")
@@ -10,8 +19,8 @@ st.write("LangChain + LangGraph + Streamlit. 支持：检索/重排/网页搜索
 with st.sidebar:
     st.header("Settings")
     st.markdown(
-        "- 若设置 `OPENAI_API_KEY` 将使用 OpenAI 模型（质量更好）\n"
-        "- 若未设置，将使用本地兜底逻辑（可用但更简单）\n"
+        "- 如设置 `OPENAI_API_KEY` 将使用 OpenAI 模型（质量更好）\n"
+        "- 未设置则使用本地兜底逻辑（可用但更简单）\n"
         "- 网页搜索使用 DuckDuckGo（requirements.txt 已包含）"
     )
     st.text_input("OPENAI_API_KEY (optional)", type="password", key="openai_key")
@@ -51,5 +60,6 @@ if user_input:
             st.json(result.get("validation", {}))
 
     st.session_state["history"].append(("assistant", answer))
+
 
 
