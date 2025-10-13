@@ -1,118 +1,136 @@
-import re
-from typing import Literal, Dict, Any, List
-from pydantic import BaseModel, Field
+# workflow.py
+# LangGraph workflow with explicit OpenAI API key usage.
 
-from search import web_search_tool
-from retrieval import load_corpus, build_faiss, hybrid_search, simple_rerank_by_len
-from validators import validate_node_output, final_answer_guardrail
+from __future__ import annotations
 
-from langchain.chat_models import init_chat_model
-from langgraph.graph import StateGraph, START, END
+import os
+from typing import TypedDict, Optional
 
-class GraphState(BaseModel):
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+
+
+# ---------- Global model (explicit api_key) ----------
+
+def init_chat_model(name: str = "gpt-4o", temperature: float = 0.0) -> ChatOpenAI:
+    """
+    Create a ChatOpenAI instance with an explicit API key.
+    The key should be provided via env var OPENAI_API_KEY (set in Streamlit Secrets).
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    # Do not proceed with empty key to avoid confusing 401s later.
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is empty. Set it in Streamlit Secrets.")
+    return ChatOpenAI(model=name, temperature=temperature, api_key=api_key)
+
+
+model: ChatOpenAI = init_chat_model("gpt-4o", temperature=0.0)
+
+
+# ---------- Graph state ----------
+
+class GraphState(TypedDict, total=False):
     question: str
-    route: Literal["rag","web","math","react","compose"] = "rag"
-    contexts: List[str] = Field(default_factory=list)
-    draft: str = ""
-    answer: str = ""
-    meta: Dict[str, Any] = Field(default_factory=dict)
+    context: str
+    answer: str
+    route: str  # "web" or "rag"
 
-def RAGAgent(state: GraphState) -> GraphState:
-    texts, _ = load_corpus("sample_data")
-    index, _ = build_faiss(texts)
-    cands = hybrid_search(state.question, texts, index=index, topk=5)
-    cands = simple_rerank_by_len(cands)
-    contexts = [c["text"] for c in cands[:3]]
-    model = init_chat_model("gpt-4o-mini")
-    prompt = "다음 컨텍스트를 기반으로 한국어로 간결하고 정확한 답변을 작성하세요.\n\n" + "\n\n---\n\n".join(contexts) + "\n\n질문: " + state.question
+
+# ---------- Nodes ----------
+
+def router(state: GraphState) -> GraphState:
+    """
+    Route to 'web' or 'rag' based on the question.
+    Simple keyword routing to demonstrate add_conditional_edges.
+    """
+    q = (state.get("question") or "").lower()
+    web_keywords = ["web", "google", "bing", "搜索", "검색", "网址", "http", "https"]
+    route = "web" if any(k in q for k in web_keywords) else "rag"
+    return {"route": route}
+
+
+def web_agent(state: GraphState) -> GraphState:
+    """
+    Web search placeholder agent.
+    We do not actually hit the web here—just instruct the model to answer generally.
+    """
+    question = state.get("question", "")
+    prompt = (
+        "You are a helpful assistant. The user asked a question that seems to require web search, "
+        "but this minimal build cannot browse the internet. Provide a general, helpful answer "
+        "and clearly state that no live web search was performed.\n\n"
+        f"Question: {question}\n\nAnswer thoughtfully:"
+    )
     resp = model.invoke(prompt)
-    draft = resp.content if hasattr(resp, "content") else str(resp)
-    state.contexts = contexts
-    state.draft = draft
-    return state
+    return {"answer": getattr(resp, "content", str(resp))}
 
-def WebSearchAgent(state: GraphState) -> GraphState:
-    search = web_search_tool()
-    results = search.run(state.question)
-    model = init_chat_model("gpt-4o-mini")
-    prompt = f"아래 웹검색 결과를 참고하여 최신성에 유의해 한국어로 요약 답변하세요.\n\n검색결과:\n{results}\n\n질문:{state.question}"
+
+def rag_agent(state: GraphState) -> GraphState:
+    """
+    Minimal RAG agent. Uses (optional) `context` if present; otherwise answers directly.
+    """
+    question = state.get("question", "")
+    context = state.get("context", "")
+    prompt = (
+        "You are a precise assistant. If the context below is relevant, use it; "
+        "otherwise answer from general knowledge. Be concise and correct.\n\n"
+        f"Context:\n{context or '[no additional context]'}\n\n"
+        f"Question: {question}\n\nAnswer:"
+    )
     resp = model.invoke(prompt)
-    state.draft = resp.content if hasattr(resp, "content") else str(resp)
-    return state
+    return {"answer": getattr(resp, "content", str(resp))}
 
-def ReActAgent(state: GraphState) -> GraphState:
-    # Simplified ReAct: try RAG first, fallback to web
-    try:
-        s = RAGAgent(state)
-    except Exception:
-        s = WebSearchAgent(state)
-    state.draft = s.draft
-    return state
 
-def AnswerComposer(state: GraphState) -> GraphState:
-    model = init_chat_model("gpt-4o-mini")
-    ctx = "\n\n".join(state.contexts) if state.contexts else "(컨텍스트 없음)"
-    prompt = f"""당신은 답변 작성기입니다.
-- 한국어로 간결하고 정중하게 답하세요.
-- 출처가 있으면 요약해서 같이 제시하세요.
-- 확신이 없으면 불확실성을 표시하세요.
+def validator(state: GraphState) -> GraphState:
+    """
+    Very small 'validation' step. If the answer looks too short,
+    ask the model to expand and add one concrete detail.
+    """
+    answer = (state.get("answer") or "").strip()
+    if len(answer) >= 40:
+        return {"answer": answer}
 
-[컨텍스트]
-{ctx}
+    fix_prompt = (
+        "The following answer is too short. Rewrite it to be clear, complete, and actionable. "
+        "Add one concrete detail or example, but keep it under 120 words.\n\n"
+        f"Original answer:\n{answer}\n\nImproved answer:"
+    )
+    resp = model.invoke(fix_prompt)
+    return {"answer": getattr(resp, "content", str(resp))}
 
-[임시 초안]
-{state.draft}
 
-[질문]
-{state.question}
-"""
-    resp = model.invoke(prompt)
-    state.answer = resp.content if hasattr(resp, "content") else str(resp)
-    return state
-
-def NodeValidator(state: GraphState) -> GraphState:
-    ok = validate_node_output({"text": state.draft})
-    state.meta["node_validation"] = ok
-    return state
-
-def FinalValidator(state: GraphState) -> GraphState:
-    res = final_answer_guardrail(state.answer)
-    state.meta["final_validation"] = res
-    if not res.get("ok", True):
-        state.answer = state.answer + f"\n\n[검증 노트] {res.get('reason')}"
-    return state
-
-def needs_recent(state: GraphState) -> Literal["web", "rag"]:
-    if any(t in state.question for t in ["오늘","최신","최근","news","오늘의","price"]):
-        return "web"
-    return "rag"
-
-def needs_math(state: GraphState) -> Literal["react","rag"]:
-    if any(ch in state.question for ch in "+-*/=%0123456789"):
-        return "react"
-    return "rag"
-
-def failed_validation(state: GraphState) -> Literal["compose", "rag"]:
-    ok = state.meta.get("node_validation", {}).get("ok", True)
-    return "compose" if ok else "rag"
+# ---------- Build graph ----------
 
 def build_graph():
-    g = StateGraph(GraphState)
-    g.add_node("RAGAgent", RAGAgent)
-    g.add_node("WebSearchAgent", WebSearchAgent)
-    g.add_node("ReActAgent", ReActAgent)
-    g.add_node("NodeValidator", NodeValidator)
-    g.add_node("AnswerComposer", AnswerComposer)
-    g.add_node("FinalValidator", FinalValidator)
+    graph = StateGraph(GraphState)
 
-    g.add_conditional_edges(START, needs_recent, {"web":"WebSearchAgent", "rag":"RAGAgent"})
-    g.add_conditional_edges("RAGAgent", needs_math, {"react":"ReActAgent", "rag":"NodeValidator"})
-    g.add_edge("WebSearchAgent", "NodeValidator")
-    g.add_edge("ReActAgent", "NodeValidator")
-    g.add_conditional_edges("NodeValidator", failed_validation, {"rag":"RAGAgent", "compose":"AnswerComposer"})
-    g.add_edge("AnswerComposer", "FinalValidator")
-    g.add_edge("FinalValidator", END)
-    return g.compile()
+    graph.add_node("router", router)
+    graph.add_node("web_agent", web_agent)
+    graph.add_node("rag_agent", rag_agent)
+    graph.add_node("validator", validator)
 
+    graph.set_entry_point("router")
+
+    # Conditional edges from router -> either web_agent or rag_agent
+    def route_selector(s: GraphState) -> str:
+        return s.get("route", "rag")
+
+    graph.add_conditional_edges(
+        "router",
+        route_selector,
+        {
+            "web": "web_agent",
+            "rag": "rag_agent",
+        },
+    )
+
+    # Both agents go to validator, then END
+    graph.add_edge("web_agent", "validator")
+    graph.add_edge("rag_agent", "validator")
+    graph.add_edge("validator", END)
+
+    return graph.compile()
+
+
+# Compiled graph exported for app_streamlit.py
 GRAPH = build_graph()
-model = init_chat_model("gpt-4o")
