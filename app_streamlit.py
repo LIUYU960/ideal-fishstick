@@ -17,7 +17,7 @@ with st.sidebar:
 if st.session_state.get("go"):
     with st.spinner("그래프 실행 중..."):
         state = GraphState(question=question)
-        result = GRAPH.invoke(state.dict())
+      result = GRAPH.invoke({"question": question})
         st.success("완료!")
         st.markdown("#### 답변")
         st.write(result.get("answer", ""))
