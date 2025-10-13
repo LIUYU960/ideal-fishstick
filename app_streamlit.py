@@ -1,8 +1,7 @@
 import streamlit as st
 from dotenv import load_dotenv
 
-# 根据你现在的仓库结构（所有文件在根目录）
-from workflow import GRAPH, GraphState  # GraphState 仅为类型标注，实际可不使用
+from workflow import GRAPH, GraphState  # GraphState
 
 load_dotenv()
 import os, streamlit as st
