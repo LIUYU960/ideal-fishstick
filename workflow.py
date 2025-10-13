@@ -1,4 +1,4 @@
-# workflow.py  —— LangGraph RAG with safe fallbacks (no hard deps required)
+# workflow.py  —— LangGraph RAG with strong fallbacks (safe without duckduckgo-search)
 
 import os
 import re
@@ -32,17 +32,16 @@ except Exception:
 try:
     from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
     from langchain_community.tools import DuckDuckGoSearchRun
-    HAVE_DDG = True
+    HAVE_DDG_IMPORTS = True
 except Exception:
-    HAVE_DDG = False
+    HAVE_DDG_IMPORTS = False
 
-# Common LangChain bits
+# Common LangChain bits（若不可用则提供极简替代）
 try:
     from langchain.docstore.document import Document
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain.agents import initialize_agent, AgentType, Tool
-except Exception as e:
-    # Minimal shims to avoid hard crash in extremely constrained envs
+except Exception:
     class Document:
         def __init__(self, page_content, metadata=None):
             self.page_content = page_content
@@ -52,15 +51,13 @@ except Exception as e:
             self.chunk_size = chunk_size
             self.chunk_overlap = chunk_overlap
         def split_text(self, text):
-            chunks = []
-            n, k, o = len(text), self.chunk_size, self.chunk_overlap
+            chunks, n, k, o = [], len(text), self.chunk_size, self.chunk_overlap
             i = 0
             while i < n:
                 chunks.append(text[i:i+k])
                 i += (k - o) if k > o else k
             return chunks
     def initialize_agent(*args, **kwargs):
-        # Return a very tiny "agent" that just echoes a placeholder
         class _A:
             def invoke(self, inputs):
                 q = inputs.get("input") if isinstance(inputs, dict) else str(inputs)
@@ -86,41 +83,30 @@ class RAGState(TypedDict, total=False):
 
 # ------------------ LLM helpers ------------------
 def make_llm(model: str | None = None, temperature: float = 0.0):
-    """
-    If OPENAI_API_KEY is present and langchain_openai is available, use ChatOpenAI.
-    Otherwise return a tiny dummy LLM that never makes network calls.
-    """
     if HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"):
         return ChatOpenAI(model=model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
                           temperature=temperature)
     class DummyLLM:
         def invoke(self, prompt):
-            # ultra-simple offline "LLM"
             txt = str(prompt)
             return type("Msg", (), {"content": "[(no-LLM)] " + txt[:500]})
     return DummyLLM()
 
 def make_embeddings():
-    """
-    Preference: OpenAI embeddings -> sentence-transformers -> simple hash-embedding.
-    """
     if HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"):
         return OpenAIEmbeddings(model="text-embedding-3-small")
     if HAVE_ST:
         return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    # final tiny fallback: hash-based embedding
     class HashEmb:
         def embed_documents(self, texts: List[str]):
             return [self._embed(t) for t in texts]
         def embed_query(self, text: str):
             return self._embed(text)
         def _embed(self, t: str):
-            # 256-dim deterministic hash embedding
             import math
             vec = [0.0]*256
             for i, ch in enumerate(t.encode("utf-8")):
                 vec[i % 256] += ((ch % 23) - 11) / 11.0
-            # L2 normalize
             norm = math.sqrt(sum(x*x for x in vec)) or 1.0
             return [x / norm for x in vec]
     return HashEmb()
@@ -141,7 +127,6 @@ def build_text_corpus(docs_path: str = "docs"):
         texts = [Document("No docs found. Add files under /docs.", {"source": "empty.md"})]
     return texts
 
-# Dummy lexical VS when FAISS不可用
 class DummyVS:
     def __init__(self, docs: List[Document]):
         self.docs = docs
@@ -159,13 +144,22 @@ def get_vs():
         return _VS
     docs = build_text_corpus("docs")
     if HAVE_FAISS:
-        # True FAISS pipeline
         embeddings = make_embeddings()
         _VS = FAISS.from_documents(docs, embeddings)
     else:
-        # Fallback lexical retriever
         _VS = DummyVS(docs)
     return _VS
+
+# --------- helper: safe ddg tool creator (handles missing dependency) ----------
+def _make_ddg_tool(max_results=4):
+    if not HAVE_DDG_IMPORTS:
+        raise ImportError("langchain_community DuckDuckGo modules not importable")
+    try:
+        wrapper = DuckDuckGoSearchAPIWrapper(region="wt-wt", time="y", max_results=max_results)
+        return DuckDuckGoSearchRun(api_wrapper=wrapper)
+    except Exception as e:
+        # This catches the case where `duckduckgo_search` package itself is not installed
+        raise ImportError(f"duckduckgo-search unavailable: {e}")
 
 # ------------------ Nodes ------------------
 def retrieve_node(state: RAGState) -> RAGState:
@@ -176,7 +170,6 @@ def retrieve_node(state: RAGState) -> RAGState:
         f"[{i+1}] {d.metadata.get('source','')} :: {d.page_content}"
         for i, d in enumerate(docs)
     ]
-    # simple coverage metric
     coverage = sum(len(d.page_content) for d in docs[:3])
     state["validation"] = {"coverage": coverage}
     return state
@@ -205,17 +198,20 @@ def rerank_node(state: RAGState) -> RAGState:
         if 1 <= i <= len(docs):
             ordered.append(docs[i-1])
     state["reranked_docs"] = ordered
-    # rough confidence heuristic
     state["validation"]["confidence"] = 0.2*len(ordered) + (1.0 if len(" ".join(ordered)) > 500 else 0.0)
     return state
 
 def websearch_node(state: RAGState) -> RAGState:
-    if not HAVE_DDG:
-        state["web_results"] = ["(web search skipped: install `duckduckgo-search` to enable)"]
+    try:
+        tool = _make_ddg_tool(max_results=4)
+    except ImportError:
+        state["web_results"] = ["(web search unavailable: install `duckduckgo-search` to enable)"]
         return state
+    except Exception as e:
+        state["web_results"] = [f"(web search init failed: {e})"]
+        return state
+
     q = state["question"]
-    wrapper = DuckDuckGoSearchAPIWrapper(region="wt-wt", time="y", max_results=4)
-    tool = DuckDuckGoSearchRun(api_wrapper=wrapper)
     try:
         raw = tool.invoke(q)
         results = [ln.strip() for ln in str(raw).split("\n") if ln.strip()]
@@ -230,10 +226,12 @@ def react_node(state: RAGState) -> RAGState:
         docs = vs.similarity_search(q, k=4)
         return "\n".join(getattr(d, "page_content", str(d))[:400] for d in docs)
 
-    if HAVE_DDG:
-        web_fn = lambda q: "\n".join(DuckDuckGoSearchAPIWrapper(max_results=3).results(q))
-    else:
-        web_fn = lambda q: "(web_search tool unavailable: install `duckduckgo-search`)"
+    def web_fn(q: str) -> str:
+        try:
+            tool = _make_ddg_tool(max_results=3)
+            return str(tool.invoke(q))
+        except Exception:
+            return "(web_search tool unavailable: install `duckduckgo-search`)"
 
     tools = [
         Tool(name="vector_retrieve", func=retrieve_tool_run,
@@ -305,7 +303,7 @@ def build_graph():
     graph.set_entry_point("retrieve")
     graph.add_edge("retrieve", "rerank")
     graph.add_conditional_edges("rerank", route_after_rerank,
-                                {"web": "web", "synth": "synthesize"})  # required conditional
+                                {"web": "web", "synth": "synthesize"})
     graph.add_edge("web", "react")
     graph.add_edge("react", "synthesize")
     graph.add_edge("synthesize", "validate")
@@ -313,6 +311,6 @@ def build_graph():
                                 {"done": END, "react": "react"})
     return graph.compile()
 
-# Exposed compiled graph for app_streamlit.py
 GRAPH = build_graph()
+
 
