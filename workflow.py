@@ -1,4 +1,5 @@
-# workflow.py — Chat-first RAG with safe splitter & zero external Document deps
+# workflow.py — Chat-first RAG with safe splitter, no external Document deps,
+# and graceful downgrade on LLM quota errors.
 
 import os, re
 from typing import TypedDict, List, Literal, Dict, Any, Optional
@@ -47,7 +48,7 @@ def make_llm(model: Optional[str] = None, temperature: float = 0.2):
                           temperature=temperature)
     class DummyLLM:
         def invoke(self, prompt):
-            # 返回自然语言文本，别回显提示词的前缀
+            # 返回自然语言，不回显系统前缀
             return type("Msg", (), {"content": str(prompt).split("\nAnswer:",1)[-1].strip()[:800]})
     return DummyLLM()
 
@@ -69,6 +70,7 @@ def make_embeddings():
 
 # ---------------- Safe splitter ----------------
 def _safe_split(text, chunk_size=800, overlap=120):
+    """安全分段：不依赖 langchain_text_splitters。"""
     parts=[]
     for para in text.split("\n\n"):
         if len(para)<=chunk_size:
@@ -119,7 +121,7 @@ _VS=None
 def get_vs():
     global _VS
     if _VS: return _VS
-    _VS = DummyVS(build_text_corpus("docs"))  # 强制使用 DummyVS，避免外部依赖
+    _VS = DummyVS(build_text_corpus("docs"))  # 使用内置检索器，避免外部依赖
     return _VS
 
 def _safe_ddg(max_results=4):
@@ -129,6 +131,30 @@ def _safe_ddg(max_results=4):
         return DuckDuckGoSearchRun(api_wrapper=wrap)
     except Exception as e:
         raise ImportError("duckduckgo-search unavailable: %s" % e)
+
+# ---------------- Smalltalk utilities ----------------
+def _smalltalk_reply(q: str) -> Optional[str]:
+    s=q.strip().lower()
+    if re.search(r"(你.?好|您.?好|你好吗|在吗|早上好|下午好|晚上好)", q):
+        return "我很好，谢谢！你呢？有什么我可以帮你的吗？"
+    if re.search(r"(안녕|안녕하세요|안녕하십니까|잘 지내|좋은\s?아침|만나서 반갑)", q):
+        return "저는 잘 지내요, 감사합니다! 무엇을 도와드릴까요?"
+    if re.search(r"\b(hi|hello|hey|good (morning|afternoon|evening)|how are you)\b", s):
+        return "I'm great, thanks! How can I help you today?"
+    return None
+
+def _detect_lang(s):
+    for ch in s:
+        if u"\u4e00"<=ch<=u"\u9fff": return "zh"
+        if u"\uac00"<=ch<=u"\ud7a3": return "ko"
+    return "en"
+
+def _simple_cn2ko_rule(q):
+    m=re.search(r"(.*?)(用)?韩语怎么说", q)
+    if not m: return None
+    term=m.group(1).strip()
+    mapping={"中文":"중국어","韩语":"한국어","英语":"영어","日语":"일본어","谢谢":"감사합니다","你好":"안녕하세요","对不起":"죄송합니다"}
+    return f"“{term}”的韩语是 **{mapping.get(term,'（建议使用 LLM 翻译）')}**。"
 
 # ---------------- Nodes ----------------
 def retrieve_node(state:RAGState)->RAGState:
@@ -177,52 +203,55 @@ def react_node(state:RAGState)->RAGState:
     except Exception as e: out=f"(react failed: {e})"
     state["draft_answer"]=out; return state
 
-def _detect_lang(s):
-    for ch in s:
-        if u"\u4e00"<=ch<=u"\u9fff": return "zh"
-        if u"\uac00"<=ch<=u"\ud7a3": return "ko"
-    return "en"
+def synthesize_node(state: RAGState) -> RAGState:
+    # 小聊直出
+    q = state.get("question", "").strip()
+    st_reply = _smalltalk_reply(q)
+    if st_reply:
+        state["final_answer"] = st_reply
+        return state
 
-def _simple_cn2ko_rule(q):
-    m=re.search(r"(.*?)(用)?韩语怎么说", q)
-    if not m: return None
-    term=m.group(1).strip()
-    mapping={"中文":"중국어","韩语":"한국어","英语":"영어","日语":"일본어","谢谢":"감사합니다","你好":"안녕하세요","对不起":"죄송합니다"}
-    return f"“{term}”的韩语是 **{mapping.get(term,'（建议使用 LLM 翻译）')}**。"
+    use_llm = bool(HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"))
+    ctx = "\n\n".join(state.get("reranked_docs", []))  # CHAT_MODE：不拼web
 
-def synthesize_node(state:RAGState)->RAGState:
-    use_llm=(HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"))
-    q=state.get("question","").strip()
-    ctx="\n\n".join(state.get("reranked_docs",[]) + ([] if CHAT_MODE else state.get("web_results",[])))
-
+    # 优先尝试 LLM —— 失败则静默降级
     if use_llm:
-        llm=make_llm()
-        sys=("You are a friendly assistant. Answer directly and naturally in the user's language. "
-             "Do not include citations, brackets, or URLs unless the user asks.")
-        user=f"Question: {q}\n\nContext:\n{ctx}\n\nAnswer:"
-        try: out=llm.invoke(sys+"\n\n"+user).content
-        except Exception as e: out=f"(synthesize failed: {e})"
-        state["final_answer"]=out; return state
+        llm = make_llm()
+        sys = ("You are a friendly assistant. Answer directly and naturally in the user's language. "
+               "Do not include citations or URLs unless the user asks.")
+        user = f"Question: {q}\n\nContext:\n{ctx}\n\nAnswer:"
+        try:
+            out = llm.invoke(sys + "\n\n" + user).content
+            state["final_answer"] = out
+            return state
+        except Exception as e:
+            # 不把错误暴露给最终用户；仅记录到 validation 里，侧边栏可见
+            state.setdefault("validation", {})["llm_error"] = f"{type(e).__name__}: {str(e)[:180]}"
+            # 继续兜底
 
-    # 无 LLM 兜底
-    lang=_detect_lang(q)
-    if lang=="zh":
-        r=_simple_cn2ko_rule(q)
-        if r: state["final_answer"]=r; return state
-        greet="好的，这是根据资料给你的简要回答："
-    elif lang=="ko":
-        greet="좋아요. 자료를 바탕으로 간단히 답변드릴게요:"
+    # —— 无 LLM 兜底（离线）——
+    lang = _detect_lang(q)
+    rule = _simple_cn2ko_rule(q) if lang == "zh" else None
+    if rule:
+        state["final_answer"] = rule
+        return state
+
+    if lang == "zh":
+        greet, tail = "好的，我来直接回答：", ""
+    elif lang == "ko":
+        greet, tail = "좋아요. 바로 답변드릴게요:", ""
     else:
-        greet="Alright—here's a brief answer based on the docs:"
+        greet, tail = "Sure — here’s a direct answer:", ""
 
-    pts=[]
+    points = []
     for d in state.get("reranked_docs", [])[:2]:
-        txt=d.split("::",1)[-1].strip().splitlines()[0]
-        pts.append("• "+txt[:120])
-    state["final_answer"]=greet+"\n"+("\n".join(pts) if pts else "• (no internal docs matched)")
+        txt = d.split("::", 1)[-1].strip().splitlines()[0]
+        points.append("• " + txt[:140])
+    state["final_answer"] = greet + ("\n" + "\n".join(points) if points else "")
     return state
 
 def validate_node(state:RAGState)->RAGState:
+    # 聊天模式：答案非空即 PASS，避免循环
     state.setdefault("validation",{})["final"]="PASS" if state.get("final_answer","").strip() else "FAIL"
     return state
 
