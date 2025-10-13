@@ -1,11 +1,10 @@
-# workflow.py — Chat-first mode (no links/citations in the final answer)
+# workflow.py — Chat-first RAG with safe splitter (no links in answers)
 
 import os, re
 from typing import TypedDict, List, Literal, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 
-# —— 开关：聊天优先（不在答案里放引用/链接）——
-CHAT_MODE = True
+CHAT_MODE = True  # 最终答案不附链接/引用
 
 # 可选依赖（缺了也能跑）
 try:
@@ -31,20 +30,10 @@ except Exception:
     HAVE_DDG_IMPORTS = False
 try:
     from langchain.docstore.document import Document
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
 except Exception:
     class Document:
         def __init__(self, page_content, metadata=None):
             self.page_content, self.metadata = page_content, (metadata or {})
-    class RecursiveCharacterTextSplitter:
-        def __init__(self, chunk_size=800, chunk_overlap=120):
-            self.chunk_size, self.chunk_overlap = chunk_size, chunk_overlap
-        def split_text(self, text):
-            out, i = [], 0
-            step = max(1, self.chunk_size - self.chunk_overlap)
-            while i < len(text):
-                out.append(text[i:i+self.chunk_size]); i += step
-            return out
 
 class RAGState(TypedDict, total=False):
     question: str
@@ -55,9 +44,12 @@ class RAGState(TypedDict, total=False):
     final_answer: str
     validation: Dict[str, Any]
 
+# ---------------- LLM helpers ----------------
 def make_llm(model: Optional[str] = None, temperature: float = 0.2):
     if HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"):
-        return ChatOpenAI(model=model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"), temperature=temperature)
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model=model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+                          temperature=temperature)
     class DummyLLM:
         def invoke(self, prompt):
             return type("Msg", (), {"content": str(prompt)[:500]})
@@ -65,8 +57,10 @@ def make_llm(model: Optional[str] = None, temperature: float = 0.2):
 
 def make_embeddings():
     if HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"):
+        from langchain_openai import OpenAIEmbeddings
         return OpenAIEmbeddings(model="text-embedding-3-small")
     if HAVE_ST:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     class HashEmb:
         def embed_documents(self, texts): return [self._e(t) for t in texts]
@@ -79,16 +73,51 @@ def make_embeddings():
             return [x/n for x in v]
     return HashEmb()
 
+# ---------------- Safe splitter ----------------
+def _safe_split(text, chunk_size=800, overlap=120):
+    """仅用 Python 实现的安全分段，不依赖 langchain_text_splitters。"""
+    parts = []
+    # 先按段落切，再按行切，最后按字数补齐
+    for para in text.split("\n\n"):
+        if len(para) <= chunk_size:
+            parts.append(para)
+        else:
+            lines = para.split("\n")
+            buf = ""
+            for ln in lines:
+                if len(buf) + len(ln) + 1 <= chunk_size:
+                    buf = (buf + "\n" + ln) if buf else ln
+                else:
+                    parts.append(buf)
+                    step = max(1, chunk_size - overlap)
+                    for i in range(0, len(ln), step):
+                        parts.append(ln[i:i+chunk_size])
+                    buf = ""
+            if buf:
+                parts.append(buf)
+    # 最后再做一次滑窗避免过长
+    final = []
+    step = max(1, chunk_size - overlap)
+    for p in parts:
+        if len(p) <= chunk_size:
+            final.append(p)
+        else:
+            for i in range(0, len(p), step):
+                final.append(p[i:i+chunk_size])
+    return [c for c in final if c.strip()]
+
+# ---------------- Vector store / Retriever ----------------
 def build_text_corpus(docs_path="docs"):
-    texts=[]; splitter=RecursiveCharacterTextSplitter(800,120)
+    texts=[]
     if os.path.isdir(docs_path):
         for root,_,files in os.walk(docs_path):
             for f in files:
                 if f.lower().endswith((".md",".txt")):
                     with open(os.path.join(root,f),"r",encoding="utf-8") as fp:
-                        for ck in splitter.split_text(fp.read()):
+                        for ck in _safe_split(fp.read(), 800, 120):
                             texts.append(Document(ck, {"source": f}))
-    if not texts: texts=[Document("No docs found. Add files under /docs.", {"source":"empty.md"})]
+    if not texts:
+        texts=[Document("No docs found. Add files under /docs.", {"source":"empty.md"})]
     return texts
 
 class DummyVS:
@@ -104,6 +133,7 @@ def get_vs():
     if _VS: return _VS
     docs=build_text_corpus("docs")
     if HAVE_FAISS:
+        from langchain_community.vectorstores import FAISS
         _VS=FAISS.from_documents(docs, make_embeddings())
     else:
         _VS=DummyVS(docs)
@@ -117,6 +147,7 @@ def _safe_ddg(max_results=4):
     except Exception as e:
         raise ImportError("duckduckgo-search unavailable: %s" % e)
 
+# ---------------- Nodes ----------------
 def retrieve_node(state:RAGState)->RAGState:
     docs=get_vs().similarity_search(state["question"], k=8)
     state["retrieved_docs"]=[f"[{i+1}] {d.metadata.get('source','')} :: {d.page_content}" for i,d in enumerate(docs)]
@@ -190,37 +221,27 @@ def synthesize_node(state:RAGState)->RAGState:
         except Exception as e: out=f"(synthesize failed: {e})"
         state["final_answer"]=out; return state
 
-    # 无 LLM 的聊天兜底
+    # 无 LLM 兜底
     lang=_detect_lang(q)
     if lang=="zh":
-        rule=_simple_cn2ko_rule(q)
-        if rule: state["final_answer"]=rule; return state
+        r=_simple_cn2ko_rule(q)
+        if r: state["final_answer"]=r; return state
         greet="好的，这是根据资料给你的简要回答："
     elif lang=="ko":
         greet="좋아요. 자료를 바탕으로 간단히 답변드릴게요:"
     else:
         greet="Alright—here's a brief answer based on the docs:"
 
-    points=[]
+    pts=[]
     for d in state.get("reranked_docs", [])[:2]:
         txt=d.split("::",1)[-1].strip().splitlines()[0]
-        points.append("• "+txt[:120])
-    state["final_answer"]=greet+"\n"+"\n".join(points or ["• (no internal docs matched)"])
+        pts.append("• "+txt[:120])
+    state["final_answer"]=greet+"\n"+("\n".join(pts) if pts else "• (no internal docs matched)")
     return state
 
 def validate_node(state:RAGState)->RAGState:
-    # 聊天模式下：只要答案非空就 PASS，避免循环
-    if CHAT_MODE:
-        state.setdefault("validation",{})["final"]="PASS" if state.get("final_answer","").strip() else "FAIL"
-        return state
-    # 非聊天模式（保留旧逻辑，若你以后想恢复带引用的答案）
-    llm=make_llm()
-    prompt=("Validator: PASS if the answer addresses the question and includes [1] or [web]. "
-            "Else FAIL. Respond with exactly PASS or FAIL.\n\n"
-            f"Q: {state.get('question','')}\nA: {state.get('final_answer','')}\nResult:")
-    try: res=llm.invoke(prompt).content.strip().upper()
-    except Exception: res="PASS" if any(tag in state.get("final_answer","") for tag in ("[1]","[web]")) else "FAIL"
-    state.setdefault("validation",{})["final"]="PASS" if "PASS" in res else "FAIL"
+    # 聊天模式：答案非空即 PASS
+    state.setdefault("validation",{})["final"]="PASS" if state.get("final_answer","").strip() else "FAIL"
     return state
 
 def route_after_rerank(state:RAGState)->Literal["web","synth"]:
