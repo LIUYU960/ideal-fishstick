@@ -1,12 +1,15 @@
 from dotenv import load_dotenv
-load_dotenv(override=False)  # 确保不覆盖 Streamlit Secrets
+load_dotenv(override=False)  # 避免 .env 覆盖 Secrets
 
-from workflow import GRAPH, GraphState  # GraphState
-
-load_dotenv()
 import os, streamlit as st
-k = os.getenv("OPENAI_API_KEY", "")
-st.caption("KEY SET" if k and k.isascii() and k.startswith("sk-") else "NO/INVALID KEY")
+from openai import OpenAI
+
+API_KEY = st.secrets["OPENAI_API_KEY"].strip()
+os.environ["OPENAI_API_KEY"] = API_KEY  # 需要的话，仍设置到环境里
+
+# 最小直连测试（成功则不抛异常）
+OpenAI(api_key=API_KEY).models.list()
+
 
 st.set_page_config(page_title="RAG Chatbot (LangGraph)", page_icon="🔎")
 st.title("🔎 LangChain/LangGraph 기반 RAG 챗봇")
