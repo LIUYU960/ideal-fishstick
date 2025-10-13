@@ -1,4 +1,4 @@
-# workflow.py —— LangGraph RAG with robust fallbacks (no agents/pydantic needed)
+# workflow.py —— LangGraph RAG with robust fallbacks (no hard deps; safe on Streamlit Cloud)
 
 import os
 import re
@@ -24,7 +24,7 @@ try:
 except Exception:
     HAVE_ST = False
 
-# Web search（可选，不装也不会崩）
+# DuckDuckGo（可选，未安装也不会崩）
 try:
     from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
     from langchain_community.tools import DuckDuckGoSearchRun
@@ -135,7 +135,7 @@ def _safe_ddg(max_results=4):
         wrapper = DuckDuckGoSearchAPIWrapper(region="wt-wt", time="y", max_results=max_results)
         return DuckDuckGoSearchRun(api_wrapper=wrapper)
     except Exception as e:
-        # 未安装 duckduckgo-search 时，这里会抛错，外层会捕获并降级
+        # 未安装 duckduckgo-search 时会抛错，这里向上抛给调用方做降级
         raise ImportError(f"duckduckgo-search unavailable: {e}")
 
 # ------------------ Nodes ------------------
@@ -196,15 +196,15 @@ def websearch_node(state: RAGState) -> RAGState:
 
 def react_node(state: RAGState) -> RAGState:
     """
-    轻量 ReAct：不用 LangChain Agents，避免 Pydantic/LLM 依赖。
-    思考→内部检索→若不够再网页搜索→综合出草稿答案。
+    轻量 ReAct：不用 LangChain Agents（避免 pydantic 依赖链），
+    思考→内部检索→必要时网页搜索→综合出草稿答案。
     """
     q = state["question"]
     vs = get_vs()
     # Thought 1: 内部检索
     docs = vs.similarity_search(q, k=4)
     internal = "\n".join(getattr(d, "page_content", str(d))[:400] for d in docs)
-    # Decide if need web
+    # 是否需要网页搜索
     need_web = len(internal) < 200
     web_text = ""
     if need_web:
@@ -214,7 +214,7 @@ def react_node(state: RAGState) -> RAGState:
             web_text = "\n".join(web_raw.split("\n")[:5])
         except Exception:
             web_text = "(web search unavailable)"
-    # Compose prompt
+    # 组织提示词并让 LLM/兜底生成草稿
     llm = make_llm()
     prompt = (
         "You are a ReAct-style assistant. Think step by step using the observations.\n"
@@ -231,19 +231,59 @@ def react_node(state: RAGState) -> RAGState:
     return state
 
 def synthesize_node(state: RAGState) -> RAGState:
-    llm = make_llm()
-    context = "\n\n".join(state.get("reranked_docs", []) + state.get("web_results", []))
-    sys_prompt = (
-        "You are a helpful, multilingual RAG assistant. "
-        "Answer in the same language as the user's question. "
-        "Cite sources inline using [n] for retrieved docs and [web] for web results."
-    )
-    user = f"Question: {state['question']}\n\nContext:\n{context}\n\nAnswer:"
-    try:
-        out = llm.invoke(sys_prompt + "\n\n" + user).content
-    except Exception as e:
-        out = f"(synthesize failed: {e})\n\nContext used:\n{context[:600]}"
-    state["final_answer"] = out
+    """
+    有 OpenAI 时用 LLM 生成；否则采用规则化兜底，避免出现 '[(no-LLM)] ...' 的回显。
+    """
+    use_llm = (HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"))
+    context_docs = state.get("reranked_docs", [])
+    web = state.get("web_results", [])
+    q = state.get("question", "").strip()
+
+    if use_llm:
+        llm = make_llm()
+        context = "\n\n".join(context_docs + web)
+        sys_prompt = (
+            "You are a helpful, multilingual RAG assistant. "
+            "Answer in the same language as the user's question. "
+            "Cite sources inline using [n] for retrieved docs and [web] for web results."
+        )
+        user = f"Question: {q}\n\nContext:\n{context}\n\nAnswer:"
+        try:
+            out = llm.invoke(sys_prompt + "\n\n" + user).content
+        except Exception as e:
+            out = f"(synthesize failed: {e})"
+        state["final_answer"] = out
+        return state
+
+    # ---- 无 LLM 兜底：用检索内容拼接简洁回答 ----
+    def detect_lang(s: str):
+        if any('\u4e00' <= ch <= '\u9fff' for ch in s): return "zh"
+        if any('가' <= ch <= '힣' for ch in s): return "ko"
+        return "en"
+
+    lang = detect_lang(q)
+    bullets = []
+    for i, d in enumerate(context_docs[:2], 1):
+        txt = d.split("::", 1)[-1].strip()
+        head = txt.splitlines()[0][:120]
+        bullets.append(f"[{i}] {head}")
+
+    if lang == "zh":
+        greeting = "你好！基于知识库为你简要回答："
+        tail = "如需更多细节可以继续提问。"
+    elif lang == "ko":
+        greeting = "안녕하세요! 지식베이스를 바탕으로 간단히 답변드립니다:"
+        tail = "추가 정보가 필요하면 질문해 주세요."
+    else:
+        greeting = "Hi! Here is a brief answer based on the knowledge base:"
+        tail = "Ask more for details."
+
+    lines = [greeting]
+    lines += [f"- {b}" for b in bullets] or ["- (no internal docs matched)"]
+    if web and "(unavailable" not in " ".join(web):
+        lines.append("- [web] " + web[0][:140])
+    lines.append(tail)
+    state["final_answer"] = "\n".join(lines)
     return state
 
 def validate_node(state: RAGState) -> RAGState:
