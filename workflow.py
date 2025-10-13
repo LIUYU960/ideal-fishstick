@@ -238,7 +238,116 @@ def _detect_lang(s):
     return "en"
 
 def _simple_cn2ko_rule(q):
-    m = re.se
+    m = re.search(r"(.*?)(用)?韩语怎么说", q)
+    if not m:
+        return None
+    term = m.group(1).strip()
+    mapping = {
+        "中文": "중국어", "韩语": "한국어", "英语": "영어", "日语": "일본어",
+        "中国": "중국", "韩国": "한국", "北京": "베이징", "首尔": "서울",
+        "谢谢": "감사합니다", "你好": "안녕하세요", "对不起": "죄송합니다"
+    }
+    if term in mapping:
+        return "“%s”的韩语是 **%s**。" % (term, mapping[term])
+    return "“%s”的韩语建议使用 LLM 翻译，或提供上下文以获得更准确表达。" % term
+
+def synthesize_node(state: RAGState) -> RAGState:
+    use_llm = (HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"))
+    context_docs = state.get("reranked_docs", [])
+    web = state.get("web_results", [])
+    q = state.get("question", "").strip()
+
+    if use_llm:
+        llm = make_llm()
+        context = "\n\n".join(context_docs + web)
+        sys_prompt = (
+            "You are a helpful, multilingual RAG assistant. "
+            "Answer in the same language as the user's question. "
+            "Cite sources inline using [n] for retrieved docs and [web] for web results."
+        )
+        user = "Question: %s\n\nContext:\n%s\n\nAnswer:" % (q, context)
+        try:
+            out = llm.invoke(sys_prompt + "\n\n" + user).content
+        except Exception as e:
+            out = "(synthesize failed: %s)" % e
+        state["final_answer"] = out
+        return state
+
+    # No LLM fallback
+    lang = _detect_lang(q)
+    if lang == "zh":
+        rule_ans = _simple_cn2ko_rule(q)
+        if rule_ans:
+            state["final_answer"] = rule_ans
+            return state
+
+    bullets = []
+    for i, d in enumerate(context_docs[:2], 1):
+        txt = d.split("::", 1)[-1].strip()
+        head = txt.splitlines()[0][:120]
+        bullets.append("[%d] %s" % (i, head))
+
+    if lang == "zh":
+        greeting = "你好！ 基于知识库为你简要回答："
+        tail = "如需更多细节可以继续提问。"
+    elif lang == "ko":
+        greeting = "안녕하세요! 지식베이스를 바탕으로 간단히 답변드립니다:"
+        tail = "추가 정보가 필요하면 질문해 주세요."
+    else:
+        greeting = "Hi! Here is a brief answer based on the knowledge base:"
+        tail = "Ask more for details."
+
+    lines = [greeting]
+    lines += ["- " + b for b in bullets] or ["- (no internal docs matched)"]
+    if web and "(unavailable" not in " ".join(web):
+        lines.append("- [web] " + web[0][:140])
+    lines.append(tail)
+    state["final_answer"] = "\n".join(lines)
+    return state
+
+def validate_node(state: RAGState) -> RAGState:
+    llm = make_llm(model=os.environ.get("VALIDATOR_MODEL", None))
+    prompt = (
+        "Validator: PASS if the answer addresses the question and includes [1] or [web]. "
+        "Else FAIL. Respond with exactly PASS or FAIL.\n\n"
+        "Q: %s\nA: %s\nResult:" % (state["question"], state.get("final_answer",""))
+    )
+    try:
+        res = llm.invoke(prompt).content.strip().upper()
+    except Exception:
+        res = "PASS" if any(tag in state.get("final_answer","") for tag in ("[1]", "[web]")) else "FAIL"
+    state.setdefault("validation", {})["final"] = "PASS" if "PASS" in res else "FAIL"
+    return state
+
+# ------------------ Routing rules ------------------
+def route_after_rerank(state: RAGState) -> Literal["web", "synth"]:
+    conf = float(state.get("validation", {}).get("confidence", 0.0))
+    return "web" if conf < 1.2 else "synth"
+
+def route_after_validate(state: RAGState) -> Literal["done", "react"]:
+    return "done" if state.get("validation", {}).get("final", "FAIL") == "PASS" else "react"
+
+# ------------------ Build graph ------------------
+def build_graph():
+    graph = StateGraph(RAGState)
+    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("rerank", rerank_node)
+    graph.add_node("web", websearch_node)
+    graph.add_node("react", react_node)
+    graph.add_node("synthesize", synthesize_node)
+    graph.add_node("validate", validate_node)
+
+    graph.set_entry_point("retrieve")
+    graph.add_edge("retrieve", "rerank")
+    graph.add_conditional_edges("rerank", route_after_rerank, {"web": "web", "synth": "synthesize"})
+    graph.add_edge("web", "react")
+    graph.add_edge("react", "synthesize")
+    graph.add_edge("synthesize", "validate")
+    graph.add_conditional_edges("validate", route_after_validate, {"done": END, "react": "react"})
+    return graph.compile()
+
+# ！！！关键：导出 GRAPH 供 app_streamlit.py 使用
+GRAPH = build_graph()
 
 
 
