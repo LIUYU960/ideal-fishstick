@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 from workflow import GRAPH, GraphState  # GraphState 仅为类型标注，实际可不使用
 
 load_dotenv()
+import os, streamlit as st
+k = os.getenv("OPENAI_API_KEY", "")
+st.caption("KEY SET" if k and k.isascii() and k.startswith("sk-") else "NO/INVALID KEY")
 
 st.set_page_config(page_title="RAG Chatbot (LangGraph)", page_icon="🔎")
 st.title("🔎 LangChain/LangGraph 기반 RAG 챗봇")
