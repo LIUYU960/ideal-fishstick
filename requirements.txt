@@ -1,9 +1,16 @@
 python-dotenv>=1.0.1
 streamlit>=1.37.0
+
+# LangChain & ecosystem
 langchain>=0.2.14
 langgraph>=0.2.23
 langchain-community>=0.2.10
+langchain-openai>=0.1.21
+
+# OpenAI SDK
 openai>=1.40.0
+
+# Retrieval stack
 duckduckgo-search>=6.2.11
 rank-bm25>=0.2.2
 tiktoken>=0.7.0
