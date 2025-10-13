@@ -1,4 +1,4 @@
-# workflow.py — Chat-first RAG with safe splitter (no links in answers)
+# workflow.py — Chat-first RAG with safe splitter & zero external Document deps
 
 import os, re
 from typing import TypedDict, List, Literal, Dict, Any, Optional
@@ -6,17 +6,12 @@ from langgraph.graph import StateGraph, END
 
 CHAT_MODE = True  # 最终答案不附链接/引用
 
-# 可选依赖（缺了也能跑）
+# --------- 可选依赖（都缺也能跑） ---------
 try:
     from langchain_openai import ChatOpenAI, OpenAIEmbeddings
     HAVE_OPENAI = True
 except Exception:
     HAVE_OPENAI = False
-try:
-    from langchain_community.vectorstores import FAISS
-    HAVE_FAISS = True
-except Exception:
-    HAVE_FAISS = False
 try:
     from langchain_community.embeddings import HuggingFaceEmbeddings
     HAVE_ST = True
@@ -28,13 +23,14 @@ try:
     HAVE_DDG_IMPORTS = True
 except Exception:
     HAVE_DDG_IMPORTS = False
-try:
-    from langchain.docstore.document import Document
-except Exception:
-    class Document:
-        def __init__(self, page_content, metadata=None):
-            self.page_content, self.metadata = page_content, (metadata or {})
 
+# --------- 自定义极简文档类型（避免外部 Document 兼容问题）---------
+class Doc:
+    def __init__(self, page_content: str, metadata: Optional[Dict[str, Any]] = None):
+        self.page_content = page_content
+        self.metadata = metadata or {}
+
+# ---------------- App State ----------------
 class RAGState(TypedDict, total=False):
     question: str
     retrieved_docs: List[str]
@@ -47,20 +43,18 @@ class RAGState(TypedDict, total=False):
 # ---------------- LLM helpers ----------------
 def make_llm(model: Optional[str] = None, temperature: float = 0.2):
     if HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"):
-        from langchain_openai import ChatOpenAI
         return ChatOpenAI(model=model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
                           temperature=temperature)
     class DummyLLM:
         def invoke(self, prompt):
-            return type("Msg", (), {"content": str(prompt)[:500]})
+            # 返回自然语言文本，别回显提示词的前缀
+            return type("Msg", (), {"content": str(prompt).split("\nAnswer:",1)[-1].strip()[:800]})
     return DummyLLM()
 
 def make_embeddings():
     if HAVE_OPENAI and os.environ.get("OPENAI_API_KEY"):
-        from langchain_openai import OpenAIEmbeddings
         return OpenAIEmbeddings(model="text-embedding-3-small")
     if HAVE_ST:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     class HashEmb:
         def embed_documents(self, texts): return [self._e(t) for t in texts]
@@ -75,32 +69,26 @@ def make_embeddings():
 
 # ---------------- Safe splitter ----------------
 def _safe_split(text, chunk_size=800, overlap=120):
-    """仅用 Python 实现的安全分段，不依赖 langchain_text_splitters。"""
-    parts = []
-    # 先按段落切，再按行切，最后按字数补齐
+    parts=[]
     for para in text.split("\n\n"):
-        if len(para) <= chunk_size:
+        if len(para)<=chunk_size:
             parts.append(para)
         else:
-            lines = para.split("\n")
-            buf = ""
+            lines=para.split("\n")
+            buf=""
             for ln in lines:
-                if len(buf) + len(ln) + 1 <= chunk_size:
-                    buf = (buf + "\n" + ln) if buf else ln
+                if len(buf)+len(ln)+1<=chunk_size:
+                    buf=(buf+"\n"+ln) if buf else ln
                 else:
-                    parts.append(buf)
-                    step = max(1, chunk_size - overlap)
+                    if buf: parts.append(buf); buf=""
+                    step=max(1, chunk_size-overlap)
                     for i in range(0, len(ln), step):
                         parts.append(ln[i:i+chunk_size])
-                    buf = ""
-            if buf:
-                parts.append(buf)
-    # 最后再做一次滑窗避免过长
-    final = []
-    step = max(1, chunk_size - overlap)
+            if buf: parts.append(buf)
+    final=[]
+    step=max(1, chunk_size-overlap)
     for p in parts:
-        if len(p) <= chunk_size:
-            final.append(p)
+        if len(p)<=chunk_size: final.append(p)
         else:
             for i in range(0, len(p), step):
                 final.append(p[i:i+chunk_size])
@@ -115,28 +103,23 @@ def build_text_corpus(docs_path="docs"):
                 if f.lower().endswith((".md",".txt")):
                     with open(os.path.join(root,f),"r",encoding="utf-8") as fp:
                         for ck in _safe_split(fp.read(), 800, 120):
-                            texts.append(Document(ck, {"source": f}))
+                            texts.append(Doc(ck, {"source": f}))
     if not texts:
-        texts=[Document("No docs found. Add files under /docs.", {"source":"empty.md"})]
+        texts=[Doc("No docs found. Add files under /docs.", {"source":"empty.md"})]
     return texts
 
 class DummyVS:
-    def __init__(self, docs): self.docs=docs
-    def similarity_search(self, q, k=8):
+    def __init__(self, docs: List[Doc]): self.docs=docs
+    def similarity_search(self, q: str, k: int = 8):
         qset=set(re.findall(r"\w+", q.lower()))
-        def score(d): return len(qset & set(re.findall(r"\w+", d.page_content.lower())))
+        def score(d: Doc): return len(qset & set(re.findall(r"\w+", d.page_content.lower())))
         return sorted(self.docs, key=score, reverse=True)[:k]
 
 _VS=None
 def get_vs():
     global _VS
     if _VS: return _VS
-    docs=build_text_corpus("docs")
-    if HAVE_FAISS:
-        from langchain_community.vectorstores import FAISS
-        _VS=FAISS.from_documents(docs, make_embeddings())
-    else:
-        _VS=DummyVS(docs)
+    _VS = DummyVS(build_text_corpus("docs"))  # 强制使用 DummyVS，避免外部依赖
     return _VS
 
 def _safe_ddg(max_results=4):
@@ -240,7 +223,6 @@ def synthesize_node(state:RAGState)->RAGState:
     return state
 
 def validate_node(state:RAGState)->RAGState:
-    # 聊天模式：答案非空即 PASS
     state.setdefault("validation",{})["final"]="PASS" if state.get("final_answer","").strip() else "FAIL"
     return state
 
