@@ -115,3 +115,4 @@ def build_graph():
     return g.compile()
 
 GRAPH = build_graph()
+model = init_chat_model("gpt-4o")
