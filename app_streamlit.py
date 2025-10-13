@@ -38,3 +38,5 @@ if run:
         import traceback
         st.error("Graph 执行出错")
         st.code("".join(traceback.format_exc()))
+import os, streamlit as st
+st.caption("KEY OK" if (os.getenv("OPENAI_API_KEY","").startswith("sk-") and os.getenv("OPENAI_API_KEY","").isascii()) else "NO/INVALID KEY")
