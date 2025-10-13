@@ -1,32 +1,38 @@
 import streamlit as st
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
-from workflow import GRAPH, GraphState
+
+# 根据你现在的仓库结构（所有文件在根目录）
+from workflow import GRAPH, GraphState  # GraphState 仅为类型标注，实际可不使用
 
 load_dotenv()
 
 st.set_page_config(page_title="RAG Chatbot (LangGraph)", page_icon="🔎")
 st.title("🔎 LangChain/LangGraph 기반 RAG 챗봇")
 
-with st.sidebar:
-    st.markdown("### 설정")
-    question = st.text_input("질문을 입력하세요", value="하이브리드 검색과 reranking이 뭐예요?")
-    if st.button("질문 보내기", type="primary"):
-        st.session_state["go"] = True
+# —— 主区输入（不用侧边栏，避免没展开看不到）——
+st.markdown("### 询问 / Ask")
+question = st.text_input("请输入你的问题（韩/中/英均可）", value="하이브리드 검색과 reranking이 뭐예요?")
+run = st.button("发送 / Ask", type="primary")
 
-if st.session_state.get("go"):
-    with st.spinner("그래프 실행 중..."):
-        state = GraphState(question=question)
-      result = GRAPH.invoke({"question": question})
-        st.success("완료!")
-        st.markdown("#### 답변")
+if run:
+    try:
+        # 关键：只传最小输入，避免 Pydantic 校验错误
+        result = GRAPH.invoke({"question": question})
+
+        st.success("完成！")
+        st.markdown("#### 答复 / Answer")
         st.write(result.get("answer", ""))
 
-        st.markdown("#### 메타데이터/검증 정보")
+        st.markdown("#### 验证与元信息 / Validation & Meta")
         st.json(result.get("meta", {}))
 
         if result.get("contexts"):
-            st.markdown("#### 사용된 컨텍스트")
+            st.markdown("#### 使用到的检索上下文 / Contexts")
             for i, c in enumerate(result["contexts"], 1):
-                with st.expander(f"컨텍스트 {i}"):
+                with st.expander(f"Context {i}"):
                     st.write(c)
+
+    except Exception as e:
+        import traceback
+        st.error("Graph 执行出错")
+        st.code("".join(traceback.format_exc()))
