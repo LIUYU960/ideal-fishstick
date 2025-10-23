@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 # LangChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_community.retrievers import BM25Retriever
