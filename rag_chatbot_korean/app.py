@@ -1,4 +1,5 @@
 import os
+import time
 from typing import List, Dict
 from textwrap import dedent
 
@@ -8,12 +9,13 @@ from pypdf import PdfReader
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
+from openai import RateLimitError  # 429 한도 초과 처리용
 
 # ------------------------
 # 기본 설정
 # ------------------------
 load_dotenv()
-st.set_page_config(page_title="나만의 RAG 챗봇 (초간단 안정판)", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="나만의 RAG 챗봇 (초간단 안정판, 한글)", page_icon="🤖", layout="wide")
 
 # ---- 스타일 ----
 st.markdown(
@@ -65,6 +67,7 @@ with col2:
 # 유틸 함수
 # ------------------------
 def read_pdf(file) -> str:
+    """텍스트 기반 PDF를 읽어 문자열로 변환 (스캔 PDF는 비권장)."""
     pdf = PdfReader(file)
     texts = []
     for p in pdf.pages:
@@ -72,10 +75,11 @@ def read_pdf(file) -> str:
     return "\n".join(texts)
 
 def read_txt(file) -> str:
+    """TXT 파일 읽기 (UTF-8, 실패 시 무시)."""
     return file.read().decode("utf-8", errors="ignore")
 
 def split_text(text: str, size: int, overlap: int) -> List[str]:
-    """아주 단순한 고정길이 청크 분할기 (의존성 최소화를 위해 직접 구현)."""
+    """아주 단순한 고정길이 청크 분할기 (의존성 최소화)."""
     chunks = []
     i = 0
     step = max(1, size - overlap)
@@ -85,6 +89,7 @@ def split_text(text: str, size: int, overlap: int) -> List[str]:
     return chunks
 
 def build_splits_from_uploads(files, size: int, overlap: int) -> List[Dict]:
+    """업로드된 파일들로 청크 리스트(splits) 생성."""
     tmp = []
     for f in files:
         name = getattr(f, "name", "uploaded")
@@ -100,7 +105,7 @@ def build_splits_from_uploads(files, size: int, overlap: int) -> List[Dict]:
     return tmp
 
 def rank_by_keywords(query: str, splits: List[Dict], k: int = 4) -> List[Dict]:
-    """아주 단순한 키워드 빈도 스코어(순수 파이썬)"""
+    """아주 단순한 키워드 빈도 스코어(순수 파이썬)."""
     q_tokens = [t for t in query.lower().split() if t.strip()]
     if not q_tokens:
         return splits[:k]
@@ -111,6 +116,14 @@ def rank_by_keywords(query: str, splits: List[Dict], k: int = 4) -> List[Dict]:
         scored.append((score, s))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [s for _, s in scored[:k]]
+
+def ensure_index_from_uploads():
+    """인덱스가 비어 있으면 업로드 파일로 자동 구축."""
+    if st.session_state.splits:
+        return
+    if not uploaded_files:
+        return
+    st.session_state.splits = build_splits_from_uploads(uploaded_files, chunk_size, chunk_overlap)
 
 # ------------------------
 # 인덱스 구축 (수동 버튼)
@@ -123,7 +136,7 @@ if st.button("🔨 인덱스 구축"):
         st.success(f"인덱스 구축 완료! 청크 수: {len(st.session_state.splits)}")
 
 # ------------------------
-# 질문하기 (자동 인덱스 구축 지원)
+# 질문하기 (자동 인덱스 구축 지원 + 한도 초과 대비)
 # ------------------------
 st.subheader("💬 질문하기")
 q = st.text_input("예: 이 문서의 핵심 요약은?")
@@ -131,52 +144,79 @@ top_k = st.slider("검색 문서 수 (k)", 1, 10, 4)
 ask = st.button("질문 보내기")
 
 if ask:
-    # 1) 인덱스가 없으면 업로드 파일로 자동 구축 시도
+    # 1) 인덱스 없으면 자동 구축
     if not st.session_state.splits and uploaded_files:
         with st.spinner("인덱스를 자동으로 구축하는 중..."):
-            st.session_state.splits = build_splits_from_uploads(uploaded_files, chunk_size, chunk_overlap)
+            ensure_index_from_uploads()
 
-    # 2) 여전히 없으면 안내
+    # 2) 기본 체크
     if not st.session_state.splits:
         st.warning("먼저 파일(.txt/.pdf)을 업로드하고 인덱스를 구축하세요.")
-    elif not q.strip():
+        st.stop()
+    if not q.strip():
         st.warning("질문을 입력하세요.")
-    elif not api_key:
+        st.stop()
+    if not api_key:
         st.error("OPENAI_API_KEY가 설정되지 않았습니다. Secrets에 키를 등록하세요.")
-    else:
-        # 검색 → 컨텍스트 구성
-        top_docs = rank_by_keywords(q, st.session_state.splits, int(top_k))
-        context = "\n\n---\n\n".join([d["text"] for d in top_docs])
-        sources = ", ".join(sorted({d["source"] for d in top_docs}))
+        st.stop()
 
-        # 프롬프트 (삼중따옴표 + dedent 로 안전하게 문자열 처리)
-        template = dedent("""\
-        당신은 업로드된 자료를 근거로 정확하고 간결하게 한국어로 답변합니다.
-        [자료]
-        {context}
+    # 3) 검색 → 컨텍스트 구성
+    top_docs = rank_by_keywords(q, st.session_state.splits, int(top_k))
+    context = "\n\n---\n\n".join([d["text"] for d in top_docs])
+    sources = ", ".join(sorted({d["source"] for d in top_docs}))
 
-        [질문]
-        {question}
+    # 4) 프롬프트
+    template = dedent("""\
+    당신은 업로드된 자료를 근거로 정확하고 간결하게 한국어로 답변합니다.
+    [자료]
+    {context}
 
-        규칙:
-        - 반드시 한국어로 답변
-        - 마지막 줄에 '근거:' 뒤에 출처 파일명 나열
+    [질문]
+    {question}
 
-        답변:
-        """)
-        prompt = PromptTemplate.from_template(template)
+    규칙:
+    - 반드시 한국어로 답변
+    - 마지막 줄에 '근거:' 뒤에 출처 파일명 나열
 
-        # LLM 호출
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-        resp = llm.invoke(prompt.format(context=context, question=q)).content
+    답변:
+    """)
+    prompt = PromptTemplate.from_template(template)
 
-        # '근거:' 보강
-        if "근거:" not in resp:
-            resp += f"\n\n근거: {sources if sources else '업로드 자료'}"
+    # 5) LLM 호출 (RateLimit 대비: 컨텍스트 자르기 + 재시도)
+    MAX_CTX_CHARS = 7000
+    ctx = context if len(context) <= MAX_CTX_CHARS else context[:MAX_CTX_CHARS]
 
-        # 기록
-        st.session_state.history.append(("user", q))
-        st.session_state.history.append(("bot", resp, list(sorted({d['source'] for d in top_docs}))))
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        max_retries=6,   # LangChain 내장 지수형 재시도
+        timeout=60
+    )
+
+    def ask_with_backoff(q_text, ctx_text):
+        try:
+            return llm.invoke(prompt.format(context=ctx_text, question=q_text)).content
+        except RateLimitError:
+            # 1차 429: 짧게 대기 후 더 짧은 컨텍스트로 재시도
+            short_ctx = ctx_text[:4000]
+            time.sleep(2)
+            return llm.invoke(prompt.format(context=short_ctx, question=q_text)).content
+
+    try:
+        resp = ask_with_backoff(q, ctx)
+    except RateLimitError:
+        st.error("OpenAI API 요청 한도를 초과했습니다. 잠시 뒤 다시 시도하거나 질문/문맥 길이를 줄여보세요.")
+        st.stop()
+    except Exception as e:
+        st.error(f"모델 호출 중 오류: {type(e).__name__}: {e}")
+        st.stop()
+
+    # 6) '근거:' 보강 및 대화 기록
+    if "근거:" not in resp:
+        resp += f"\n\n근거: {sources if sources else '업로드 자료'}"
+
+    st.session_state.history.append(("user", q))
+    st.session_state.history.append(("bot", resp, list(sorted({d['source'] for d in top_docs}))))
 
 # ------------------------
 # 대화 기록
@@ -201,4 +241,5 @@ st.markdown(
     f'<p class="tiny">© {_t.strftime("%Y")} 중간고사용 RAG 초안정판 | Secrets에 OPENAI_API_KEY 등록 필수.</p>',
     unsafe_allow_html=True
 )
+
 
