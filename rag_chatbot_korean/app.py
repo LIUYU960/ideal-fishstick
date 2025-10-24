@@ -103,6 +103,120 @@ if ask:
 [자료]
 {context}
 
+# ---- 질문 ----
+st.subheader("💬 질문하기")
+q = st.text_input("예: 이 문서의 핵심 요약은?")
+top_k = st.slider("검색 문서 수 (k)", 1, 10, 4)
+ask = st.button("질문 보내기")
+
+def split_text(text: str, size: int, overlap: int):
+    chunks, i = [], 0
+    step = max(1, size - overlap)
+    while i < len(text):
+        chunks.append(text[i:i+size])
+        i += step
+    return chunks
+
+def ensure_index_from_uploads():
+    # 이미 구축되어 있으면 그대로 사용
+    if st.session_state.get("splits"):
+        return
+    if not uploaded:
+        return
+    tmp = []
+    for f in uploaded:
+        name = getattr(f, "name", "uploaded")
+        if name.lower().endswith(".pdf"):
+            from pypdf import PdfReader
+            pdf = PdfReader(f)
+            text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
+        elif name.lower().endswith(".txt"):
+            text = f.read().decode("utf-8", errors="ignore")
+        else:
+            continue  # 只支持 pdf/txt
+        for ch in split_text(text, int(chunk_size), int(chunk_overlap)):
+            if ch.strip():
+                tmp.append({"text": ch, "source": name})
+    st.session_state.splits = tmp
+
+if ask:
+    # ① 自动尝试建索引
+    if not st.session_state.get("splits"):
+        with st.spinner("인덱스를 자동으로 구축하는 중..."):
+            ensure_index_from_uploads()
+
+    # ② 仍然没有可用文本，给出提示
+    if not st.session_state.get("splits"):
+        st.warning("먼저 파일(.txt/.pdf)을 업로드하고 인덱스를 구축하세요.")
+    elif not q.strip():
+        st.warning("질문을 입력하세요.")
+    else:
+        # 下面是你的检索与回答逻辑（保持不变）
+        top_docs = rank_by_keywords(q, st.session_state.splits, int(top_k))
+        context = "\n\n---\n\n".join([d["text"] for d in top_docs])
+        sources = ", ".join(sorted({d["source"] for d in top_docs}))
+        template = """
+당신은 업로드된 자료를 근거로 정확하고 간결하게 한국어로 답변합니다.
+[자료]
+{context}
+
+# ---- 질문 ----
+st.subheader("💬 질문하기")
+q = st.text_input("예: 이 문서의 핵심 요약은?")
+top_k = st.slider("검색 문서 수 (k)", 1, 10, 4)
+ask = st.button("질문 보내기")
+
+def split_text(text: str, size: int, overlap: int):
+    chunks, i = [], 0
+    step = max(1, size - overlap)
+    while i < len(text):
+        chunks.append(text[i:i+size])
+        i += step
+    return chunks
+
+def ensure_index_from_uploads():
+    # 이미 구축되어 있으면 그대로 사용
+    if st.session_state.get("splits"):
+        return
+    if not uploaded:
+        return
+    tmp = []
+    for f in uploaded:
+        name = getattr(f, "name", "uploaded")
+        if name.lower().endswith(".pdf"):
+            from pypdf import PdfReader
+            pdf = PdfReader(f)
+            text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
+        elif name.lower().endswith(".txt"):
+            text = f.read().decode("utf-8", errors="ignore")
+        else:
+            continue  # 只支持 pdf/txt
+        for ch in split_text(text, int(chunk_size), int(chunk_overlap)):
+            if ch.strip():
+                tmp.append({"text": ch, "source": name})
+    st.session_state.splits = tmp
+
+if ask:
+    # ① 自动尝试建索引
+    if not st.session_state.get("splits"):
+        with st.spinner("인덱스를 자동으로 구축하는 중..."):
+            ensure_index_from_uploads()
+
+    # ② 仍然没有可用文本，给出提示
+    if not st.session_state.get("splits"):
+        st.warning("먼저 파일(.txt/.pdf)을 업로드하고 인덱스를 구축하세요.")
+    elif not q.strip():
+        st.warning("질문을 입력하세요.")
+    else:
+        # 下面是你的检索与回答逻辑（保持不变）
+        top_docs = rank_by_keywords(q, st.session_state.splits, int(top_k))
+        context = "\n\n---\n\n".join([d["text"] for d in top_docs])
+        sources = ", ".join(sorted({d["source"] for d in top_docs}))
+        template = """
+당신은 업로드된 자료를 근거로 정확하고 간결하게 한국어로 답변합니다.
+[자료]
+{context}
+
 [질문]
 {question}
 
@@ -112,27 +226,12 @@ if ask:
 
 답변:
 """
-            prompt = PromptTemplate.from_template(template)
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-            resp = llm.invoke(prompt.format(context=context, question=q)).content
-            # 근거 보강
-            if "근거:" not in resp:
-                resp += f"\n\n근거: {sources if sources else '업로드 자료'}"
-
-            st.session_state.history.append(("user", q))
-            st.session_state.history.append(("bot", resp, list(sorted({d['source'] for d in top_docs}))))
-
-        except Exception as e:
-            st.error(f"오류: {e}")
-
-st.subheader("🧾 대화 기록")
-for item in st.session_state.history:
-    if item[0] == "user":
-        st.markdown(f"**나:** {item[1]}")
-    else:
-        ans, srcs = item[1], item[2]
-        st.markdown(f"**봇:** {ans}")
-        if srcs:
-            with st.expander("🔎 참고/근거 문서"):
-                for s in srcs:
-                    st.markdown(f"- `{s}`")
+        from langchain_openai import ChatOpenAI
+        from langchain_core.prompts import PromptTemplate
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+        prompt = PromptTemplate.from_template(template)
+        resp = llm.invoke(prompt.format(context=context, question=q)).content
+        if "근거:" not in resp:
+            resp += f"\n\n근거: {sources if sources else '업로드 자료'}"
+        st.session_state.history.append(("user", q))
+        st.session_state.history.append(("bot", resp, list(sorted({d['source'] for d in top_docs}))))
